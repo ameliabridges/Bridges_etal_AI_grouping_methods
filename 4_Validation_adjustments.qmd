@@ -1,0 +1,232 @@
+---
+title: "Validation_adjustments"
+format: html
+editor: source
+---
+
+# Prepare your working environment
+
+## Libraries 
+
+```{r, message = FALSE, warning=FALSE}
+
+library(tidyverse)
+library(magrittr)
+library(zip)
+# library(taxize)
+
+```
+
+## Folder structure
+
+```{r, message=FALSE , warning=FALSE}
+project_folder<-"/Volumes/One Touch/Main_folder/Projects/AI/"
+reports_dir<-paste0(project_folder, "BIIGLE_reports/BIIGLE_reports_Validation_Subsamples")
+```
+
+# Import data
+
+## Combine the original zipped files
+
+```{r}
+
+# list all files (in this case zips) in the 'reports' folder with the specified pattern in their filename
+files<-list.files(reports_dir, pattern = "csv_image_annotation_report")
+
+# make a metadata table
+annotationTables<-tibble(file = files) %>%
+  mutate(table_name = str_remove(file, pattern = ".zip")) %>%
+  mutate(volume = str_remove(table_name, pattern = "_csv_image_annotation_report")) # make a column of volume ID number
+
+# make a list to store all transformed tables
+Dframes  <- as.list(1:nrow(annotationTables))
+
+for (i in seq(Dframes)) {
+  # select the table number i
+  annotationTables %>% slice(i) -> meta.i
+  # read the name of the table 
+ meta.i %>% pull(file) %>% paste(reports_dir, ., sep = "/") %>%
+   zip::zip_list() %>%
+   pull(filename) %>%
+   str_remove(".csv") %>%
+   str_remove(pattern = paste0(meta.i$volume,"-")) -> meta.i$volume_name
+  # import it
+  meta.i %>% pull(file) %>% paste(reports_dir, ., sep = "/") %>%
+    read_csv(col_types = cols()) -> D.i
+  
+  # if there are no annotations, skip to the next report
+  if(D.i %>% nrow() < 1){
+    print(paste0("No annotations in ",meta.i$volume, "-", meta.i$volume_name))
+    tibble() ->  Dframes[[i]]
+    next
+  }
+  # add the metadata
+  bind_cols(D.i, meta.i) ->   D.imeta
+    
+  D.imeta ->  Dframes[[i]]
+  
+  rm(D.i, D.imeta)
+  
+}
+
+# This is your table of everything
+combined_adjusted<-Dframes %>%
+  bind_rows()
+
+```
+
+## Format
+
+Save validation labels only. 
+
+```{r}
+val_labels<-c("TP_legit", "TP_missed", "FP_nothing_or_incorrect", "FP_duplicate", "FN_record")
+
+val_annotations<-combined_adjusted %>% 
+  filter(label_name %in% val_labels)
+
+```
+
+Split into different models. 
+
+```{r}
+full_val_anns<-val_annotations %>% 
+  filter(volume_name=="full-model-validation-subsample")
+
+phy_val_anns<-val_annotations %>% 
+  filter(volume_name=="phylum-model-validation-subsample")
+
+ani_val_anns<-val_annotations %>% 
+  filter(volume_name=="animal-model-validation-subsample")
+```
+
+# Calculate FP correction rate
+
+## Animal model 
+
+```{r}
+ani_val_anns %>% count(label_name)
+```
+
+```{r}
+# annotations that the val.py script would have considered FPs
+ani_original_FPs<-ani_val_anns %>% 
+  filter(label_name=="TP_missed" | label_name=="FP_duplicate" | label_name=="FP_nothing_or_incorrect")
+
+# annotations that were FPs but should be TPs
+ani_FPs_to_TPs<-ani_val_anns %>% 
+  filter(label_name=="TP_missed")
+
+# incorrect FPs as % of annotations
+fpcr_ani<-(nrow(ani_FPs_to_TPs)/nrow(ani_original_FPs))*100
+
+```
+
+## Phylum model 
+
+```{r}
+phy_val_anns %>% count(label_name)
+```
+
+```{r}
+# annotations that the val.py script would have considered FPs
+phy_original_FPs<-phy_val_anns %>% 
+  filter(label_name=="TP_missed" | label_name=="FP_duplicate" | label_name=="FP_nothing_or_incorrect")
+
+# annotations that were FPs but should be TPs
+phy_FPs_to_TPs<-phy_val_anns %>% 
+  filter(label_name=="TP_missed")
+
+# incorrect FPs as % of annotations
+fpcr_phy<-(nrow(phy_FPs_to_TPs)/nrow(phy_original_FPs))*100
+
+```
+
+## Full model 
+
+```{r}
+full_val_anns %>% count(label_name)
+```
+
+```{r}
+# annotations that the val.py script would have considered FPs
+full_original_FPs<-full_val_anns %>% 
+  filter(label_name=="TP_missed" | label_name=="FP_duplicate" | label_name=="FP_nothing_or_incorrect")
+
+# annotations that were FPs but should be TPs
+full_FPs_to_TPs<-full_val_anns %>% 
+  filter(label_name=="TP_missed")
+
+# incorrect FPs as % of annotations
+fpcr_full<-(nrow(full_FPs_to_TPs)/nrow(full_original_FPs))*100
+
+```
+
+
+# Calculate new P & R
+
+## Animal
+
+```{r}
+corrected_ani_TPs<-nrow(ani_val_anns %>% 
+  filter(label_name=="TP_missed" | label_name=="TP_legit"))
+
+corrected_ani_FPs<-nrow(ani_val_anns %>% 
+  filter(label_name=="FP_nothing_or_incorrect" | label_name=="FP_duplicate"))
+
+ani_FNs<-nrow(ani_val_anns %>% 
+  filter(label_name=="FN_record"))
+```
+
+```{r}
+Animal_Corrected_P <- corrected_ani_TPs/(corrected_ani_TPs+corrected_ani_FPs)
+Animal_Corrected_R <- corrected_ani_TPs/(corrected_ani_TPs+ani_FNs)
+```
+
+## Phylum
+
+```{r}
+corrected_phy_TPs<-nrow(phy_val_anns %>% 
+  filter(label_name=="TP_missed" | label_name=="TP_legit"))
+
+corrected_phy_FPs<-nrow(phy_val_anns %>% 
+  filter(label_name=="FP_nothing_or_incorrect" | label_name=="FP_duplicate"))
+
+phy_FNs<-nrow(phy_val_anns %>% 
+  filter(label_name=="FN_record"))
+```
+
+```{r}
+Phylum_Corrected_P <- corrected_phy_TPs/(corrected_phy_TPs+corrected_phy_FPs)
+Phylum_Corrected_R <- corrected_phy_TPs/(corrected_phy_TPs+phy_FNs)
+```
+
+## Full
+
+```{r}
+corrected_full_TPs<-nrow(full_val_anns %>% 
+  filter(label_name=="TP_missed" | label_name=="TP_legit"))
+
+corrected_full_FPs<-nrow(full_val_anns %>% 
+  filter(label_name=="FP_nothing_or_incorrect" | label_name=="FP_duplicate"))
+
+full_FNs<-nrow(full_val_anns %>% 
+  filter(label_name=="FN_record"))
+```
+
+```{r}
+Full_Corrected_P <- corrected_full_TPs/(corrected_full_TPs+corrected_full_FPs)
+Full_Corrected_R <- corrected_full_TPs/(corrected_full_TPs+full_FNs)
+```
+
+# Compare metrics
+
+```{r}
+tibble(Model = c("Full", "Phylum", "Animal"),
+       TPs=c(corrected_full_TPs, corrected_phy_TPs, corrected_ani_TPs),
+       FPs=c(corrected_full_FPs, corrected_phy_FPs, corrected_ani_FPs),
+       FNs=c(full_FNs, phy_FNs, ani_FNs),
+       Precision = c(Full_Corrected_P, Phylum_Corrected_P, Animal_Corrected_P),
+       Recall = c(Full_Corrected_R, Phylum_Corrected_R, Animal_Corrected_R))
+```
+

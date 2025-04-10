@@ -1,0 +1,454 @@
+---
+title: "Checking BIIGLE outputs for AI"
+format: html
+editor: source
+---
+
+# Prepare your working environment
+
+```{r, message = FALSE, warning=FALSE}
+
+library(tidyverse)
+library(magrittr)
+library(zip)
+# library(taxize)
+
+```
+
+# Importing JC136_Combined data
+
+You need your BIIGLE volume zips in a folder called 'reports' and the label tree with aphia IDs in a folder called 'taxonomy'.
+
+```{r, message=FALSE , warning=FALSE}
+project_folder<-"/Volumes/One Touch/Main_folder/Projects/AI/"
+reports_dir<-paste0(project_folder, "BIIGLE_reports/BIIGLE_reports_JC136_Combined")
+tree_dir<-paste0(project_folder, "Tree_reports")
+data_checks<-paste0(project_folder, "AI_comparing_grouping_methods/data_check_files")
+
+```
+
+## Combine the original zipped files
+
+The following chunk unzips each volume in your 'reports' folders and combines the CSVs to output a dataframe of all your annotations from within your project as one continuous table ('allannotations'). It will also spit out a list in the console of all the volumes that *don't* have annotations.
+
+```{r}
+
+# list all files (in this case zips) in the 'reports' folder with the specified pattern in their filename
+files<-list.files(reports_dir, pattern = "csv_image_annotation_report")
+
+# make a metadata table
+annotationTables<-tibble(file = files) %>%
+  mutate(table_name = str_remove(file, pattern = ".zip")) %>%
+  mutate(volume = str_remove(table_name, pattern = "_csv_image_annotation_report")) # make a column of volume ID number
+
+# make a list to store all transformed tables
+Dframes  <- as.list(1:nrow(annotationTables))
+
+for (i in seq(Dframes)) {
+  # select the table number i
+  annotationTables %>% slice(i) -> meta.i
+  # read the name of the table 
+ meta.i %>% pull(file) %>% paste(reports_dir, ., sep = "/") %>%
+   zip::zip_list() %>%
+   pull(filename) %>%
+   str_remove(".csv") %>%
+   str_remove(pattern = paste0(meta.i$volume,"-")) -> meta.i$volume_name
+  # import it
+  meta.i %>% pull(file) %>% paste(reports_dir, ., sep = "/") %>%
+    read_csv(col_types = cols()) -> D.i
+  
+  # if there are no annotations, skip to the next report
+  if(D.i %>% nrow() < 1){
+    print(paste0("No annotations in ",meta.i$volume, "-", meta.i$volume_name))
+    tibble() ->  Dframes[[i]]
+    next
+  }
+  # add the metadata
+  bind_cols(D.i, meta.i) ->   D.imeta
+    
+  D.imeta ->  Dframes[[i]]
+  
+  rm(D.i, D.imeta)
+  
+}
+
+# This is your table of everything
+jc136annotations<-Dframes %>%
+  bind_rows()
+
+```
+
+## Check for instances where \>1 label is attached to an annotation
+
+```{r}
+
+x<-unique(jc136annotations$annotation_id) # creates vector called x containing all the unique annotation IDs
+
+if(jc136annotations %>%
+   nrow() != length(x)){
+    print("The number of annotations doesn't match the number of labels... back to BIIGLE you go!")} # prints my hilarious message if the number of rows in all annotations (i.e. number of shapes in BIIGLE) doesn't match the number of unique annotation IDs
+
+duplicate_annotations<-jc136annotations %>%
+  group_by(annotation_id) %>% # groups records by annotation ID  
+  summarise(count = n()) %>% # counts number of annotation IDs
+  filter(count > 1) # gives results where an annottaions ID has appeared more than once and thus has >1 label attached
+
+dup_details<-left_join(duplicate_annotations, jc136annotations, by = "annotation_id") %>%
+  select(annotation_id, filename, label_name, firstname)
+
+write.csv(dup_details, paste0(data_checks, "/duplicate_details_jc136annotations.csv")) # you can now go through BIIGLE and amend accordingly based on this list
+```
+
+## Select images with a particular label present (e.g. 'Finished')
+
+```{r}
+labs<- jc136annotations %>%
+  filter(label_name=="Finished") # 
+finishedimages<-as.data.frame(labs$image_id)
+names(finishedimages)[1] <- "finished_image_ids"
+
+jc136_ai_annotations<-jc136annotations %>%
+  filter(image_id %in% finishedimages$finished_image_ids) %>% # keeps only annotations from images marked as finished
+  filter(!str_detect(label_hierarchy, 'Notes')) # removes annotations from trees with Notes in title
+
+```
+
+# Importing Nicola's data
+
+```{r, message=FALSE , warning=FALSE}
+
+reports_dir<-paste0(project_folder, "BIIGLE_reports/BIIGLE_reports_Nicola_Remade_AB")
+
+```
+
+## Combine the original zipped files
+
+The following chunk unzips each volume in your 'reports' folders and combines the CSVs to output a dataframe of all your annotations from within your project as one continuous table ('allannotations'). It will also spit out a list in the console of all the volumes that *don't* have annotations.
+
+```{r}
+
+# list all files (in this case zips) in the 'reports' folder with the specified pattern in their filename
+files<-list.files(reports_dir, pattern = "csv_image_annotation_report")
+
+# make a metadata table
+annotationTables<-tibble(file = files) %>%
+  mutate(table_name = str_remove(file, pattern = ".zip")) %>%
+  mutate(volume = str_remove(table_name, pattern = "_csv_image_annotation_report")) # make a column of volume ID number
+
+# make a list to store all transformed tables
+Dframes  <- as.list(1:nrow(annotationTables))
+
+for (i in seq(Dframes)) {
+  # select the table number i
+  annotationTables %>% slice(i) -> meta.i
+  # read the name of the table 
+ meta.i %>% pull(file) %>% paste(reports_dir, ., sep = "/") %>%
+   zip::zip_list() %>%
+   pull(filename) %>%
+   str_remove(".csv") %>%
+   str_remove(pattern = paste0(meta.i$volume,"-")) -> meta.i$volume_name
+  # import it
+  meta.i %>% pull(file) %>% paste(reports_dir, ., sep = "/") %>%
+    read_csv(col_types = cols()) -> D.i
+  
+  # if there are no annotations, skip to the next report
+  if(D.i %>% nrow() < 1){
+    print(paste0("No annotations in ",meta.i$volume, "-", meta.i$volume_name))
+    tibble() ->  Dframes[[i]]
+    next
+  }
+  # add the metadata
+  bind_cols(D.i, meta.i) ->   D.imeta
+    
+  D.imeta ->  Dframes[[i]]
+  
+  rm(D.i, D.imeta)
+  
+}
+
+# This is your table of everything
+nicannotations<-Dframes %>%
+  bind_rows()
+
+```
+
+## Check for instances where \>1 label is attached to an annotation
+
+```{r}
+
+x<-unique(nicannotations$annotation_id) # creates vector called x containing all the unique annotation IDs
+
+if(nicannotations %>%
+   nrow() != length(x)){
+    print("The number of annotations doesn't match the number of labels... back to BIIGLE you go!")} # prints my hilarious message if the number of rows in all annotations (i.e. number of shapes in BIIGLE) doesn't match the number of unique annotation IDs
+
+duplicate_annotations<-nicannotations %>%
+  group_by(annotation_id) %>% # groups records by annotation ID  
+  summarise(count = n()) %>% # counts number of annotation IDs
+  filter(count > 1) # gives results where an annottaions ID has appeared more than once and thus has >1 label attached
+
+dup_details<-left_join(duplicate_annotations, nicannotations, by = "annotation_id") %>%
+  select(annotation_id, filename, label_name, firstname)
+
+write.csv(dup_details, paste0(data_checks, "/duplicate_details_nicannotations.csv")) # you can now go through BIIGLE and amend accordingly based on this list
+
+```
+
+# Importing Alt Sweden data
+
+```{r, message=FALSE , warning=FALSE}
+
+reports_dir<-paste0(project_folder, "BIIGLE_reports/BIIGLE_reports_AltSweden")
+
+```
+
+## Combine the original zipped files
+
+```{r}
+
+# list all files (in this case zips) in the 'reports' folder with the specified pattern in their filename
+files<-list.files(reports_dir, pattern = "csv_image_annotation_report")
+
+# make a metadata table
+annotationTables<-tibble(file = files) %>%
+  mutate(table_name = str_remove(file, pattern = ".zip")) %>%
+  mutate(volume = str_remove(table_name, pattern = "_csv_image_annotation_report")) # make a column of volume ID number
+
+# make a list to store all transformed tables
+Dframes  <- as.list(1:nrow(annotationTables))
+
+for (i in seq(Dframes)) {
+  # select the table number i
+  annotationTables %>% slice(i) -> meta.i
+  # read the name of the table 
+ meta.i %>% pull(file) %>% paste(reports_dir, ., sep = "/") %>%
+   zip::zip_list() %>%
+   pull(filename) %>%
+   str_remove(".csv") %>%
+   str_remove(pattern = paste0(meta.i$volume,"-")) -> meta.i$volume_name
+  # import it
+  meta.i %>% pull(file) %>% paste(reports_dir, ., sep = "/") %>%
+    read_csv(col_types = cols()) -> D.i
+  
+  # if there are no annotations, skip to the next report
+  if(D.i %>% nrow() < 1){
+    print(paste0("No annotations in ",meta.i$volume, "-", meta.i$volume_name))
+    tibble() ->  Dframes[[i]]
+    next
+  }
+  # add the metadata
+  bind_cols(D.i, meta.i) ->   D.imeta
+    
+  D.imeta ->  Dframes[[i]]
+  
+  rm(D.i, D.imeta)
+  
+}
+
+# This is your table of everything
+swedenannotations<-Dframes %>%
+  bind_rows()
+
+```
+
+## Check for instances where \>1 label is attached to an annotation
+
+```{r}
+
+x<-unique(swedenannotations$annotation_id) # creates vector called x containing all the unique annotation IDs
+
+if(swedenannotations %>%
+   nrow() != length(x)){
+    print("The number of annotations doesn't match the number of labels... back to BIIGLE you go!")} # prints my hilarious message if the number of rows in all annotations (i.e. number of shapes in BIIGLE) doesn't match the number of unique annotation IDs
+
+duplicate_annotations<-swedenannotations %>%
+  group_by(annotation_id) %>% # groups records by annotation ID  
+  summarise(count = n()) %>% # counts number of annotation IDs
+  filter(count > 1) # gives results where an annottaions ID has appeared more than once and thus has >1 label attached
+
+dup_details<-left_join(duplicate_annotations, swedenannotations, by = "annotation_id") %>%
+  select(annotation_id, filename, label_name, firstname)
+
+write.csv(dup_details, paste0(data_checks, "/duplicate_details_swedenannotations.csv")) # you can now go through BIIGLE and amend accordingly based on this list
+
+```
+
+## Select images with a particular label present (e.g. 'Finished')
+
+```{r}
+labs<- swedenannotations %>%
+  filter(label_name=="Finished") # 
+finishedimages<-as.data.frame(labs$image_id)
+names(finishedimages)[1] <- "finished_image_ids"
+
+swedenannotations<-swedenannotations %>%
+  filter(image_id %in% finishedimages$finished_image_ids) %>% # keeps only annotations from images marked as finished
+  filter(!str_detect(label_hierarchy, 'Substrate')) %>%
+  filter(!str_detect(label_hierarchy, 'Training Notes')) %>%
+  filter(!str_detect(label_hierarchy, 'lost+found'))# removes annotations from trees with Notes in title
+
+```
+
+## Remove Sweden annotations where images are also in JC136
+
+```{r}
+sweden_images<- as.data.frame(unique(swedenannotations$filename))
+# jc136_images<- as.data.frame(unique(jc136_ai_annotations$filename))
+
+names(sweden_images)[1] <- "sweden_images"
+# names(jc136_images)[1] <- "jc136_images"
+
+double_annotated_images<-jc136_ai_annotations %>%
+  filter(filename %in% sweden_images$sweden_images) 
+
+```
+
+There are some images that were annotated by students in the JC136_Combined dataset that were also annotated by students in the replacement Sweden exercise. I need to extract annotations where the filenames feature in that duplicate list.
+
+```{r}
+double_annotated_filenames<- as.data.frame(unique(double_annotated_images$filename))
+
+names(double_annotated_filenames)[1]<-"filename"
+
+sweden_ai_annotations<-swedenannotations[!(swedenannotations$filename %in% double_annotated_filenames$filename),]
+
+```
+
+# Combine desired JC136 annotations with Nicola's
+
+```{r}
+ai_annotations<-rbind(jc136_ai_annotations, sweden_ai_annotations, nicannotations)
+```
+
+# Extract list of labels that have annotations
+
+```{r}
+# not entirely necesary but useful code nontheless
+actual_list<-ai_annotations %>% 
+  select(label_id, label_name, label_hierarchy)
+actual_list<-unique(actual_list)
+write.csv(actual_list, paste0(data_checks, "/list_of_used_labels.csv"))
+```
+
+# Filter labels by tree
+
+```{r}
+# hybrid_tree<-read.csv(paste0(tree_dir, "/hybrid_tree_labels.csv"), head=T, sep=",")
+# names(hybrid_tree)[2]<-"label_name"
+# 
+# morph_tree<-read.csv(paste0(tree_dir, "/morphology_tree_labels.csv"), head=T, sep=",")
+# names(morph_tree)[2]<-"label_name"
+# morph_tree_bo_labels<-morph_tree %>%
+#   filter(str_detect(label_name, "Bottlebrush|Branching 3D"))
+
+
+
+# ai_hybrid_annotations<-ai_annotations%>%
+#  filter(label_id %in% hybrid_tree$id) # keeps only annotations where the label_id matches an id in the hybrid tree
+# 
+# ai_morph_annotations<-ai_annotations%>%
+#   filter(label_id %in% morph_tree$id)
+
+```
+
+# Extract taxonomic data for labels
+
+```{r}
+used_labels<-read.csv(paste0(tree_dir, "/used_labels.csv"), head=T, sep=",")
+ai_annotations_taxonomy<-left_join(ai_annotations,used_labels, by = "label_name")
+
+# aphia_id<-fsc_taxa %>% 
+#   drop_na(aphia_id) # there are 3 labels in FSC_taxa that don't have aphia IDs (e.g. burrows) so I've removed them for this bit 
+# 
+# aphia_id<-unique(aphia_id$aphia_id) # lists all unique aphia IDs from our tree
+# 
+# taxa_dat<-dplyr::as_tibble(cbind(classification(aphia_id, db="worms"))) # creates a table of taxonomic data based on the aphia IDs we have
+# 
+# taxa_dat<-cbind(aphia_id,taxa_dat) # adds aphia IDs back onto the taxonomic data
+# 
+# taxa_dat<-full_join(taxa_dat, fsc_taxa, by = "aphia_id") # combines the relevant BIIGLE info and the taxonomic info
+
+# extracting the OTU numbers
+# taxa_dat<- taxa_dat %>%
+#   mutate(otu_code=(as.numeric(str_extract(name, "[0-9]+")))) %>%
+#   mutate(otu_yn=(str_extract(name, "OTU"))) %>%
+#   mutate(tax_name="TBC") %>%
+#   select(aphia_id, phylum, class, order, family, genus, species, tax_name, name, catami_class, otu_code, otu_yn) %>%
+#   unite(otu_num, c("otu_yn", "otu_code"), sep="", remove=TRUE, na.rm = TRUE) 
+
+# ai_hybrid_annotations_taxonomy<-left_join(ai_hybrid_annotations,hybrid_tree, by = "label_name")
+
+# ai_morph_annotations_taxonomy<-left_join(ai_morph_annotations,morph_tree, by = "label_name")
+
+```
+
+# Check correct tools have been used to annotate
+
+```{r}
+# sponge_annotations<-allannotations_taxonomy%>%
+#   filter(str_detect(phylum, "Porifera")) # creates df of sponge annotations only
+
+tool_use_check<-ai_annotations_taxonomy %>%
+  group_by(shape_name, filename, label_name) %>% # groups records by shape and image name and label name
+  # count the
+  summarise(count = n()) %>%
+  filter(!str_detect(shape_name, "Rectangle")) # saves only records where polygon is not the shape used
+
+write.csv(tool_use_check, paste0(data_checks, "/non_rectangle_annotations.csv"))
+
+# unique(tool_use_check$label_name)
+```
+
+Rock oysters and barnacles were annotated as points :(
+
+# Investigating class sizes
+
+```{r}
+ai_class_sizes<-ai_annotations_taxonomy %>%
+  # keep the label and its hierarchy
+  group_by(ai_class) %>%
+  # count the
+  summarise(count = n()) #%>%
+  #mutate(modellable=case_when(count <200 ~ "no", count >=200 ~"yes"))
+
+yolo_folder<-paste0(getwd(), "/YOLO")
+
+# IF WORKING ON MAC
+# yolo_folder<-"/Volumes/NOC_Drive/OneDrive/OneDrive - University of Plymouth/Projects/AI/AI_postdoc/YOLO"
+
+write.csv(ai_class_sizes, paste0(yolo_folder, "/ai_class_sizes.csv"), row.names = F)
+
+# high_res_class_sizes<-ai_annotations_taxonomy %>%
+#   # keep the label and its hierarchy
+#   group_by(label_name) %>%
+#   # count the
+#   summarise(count = n()) %>%
+#   mutate(modellable=case_when(count <200 ~ "no", count >=200 ~"yes"))
+# write.csv(high_res_class_sizes, paste0(yolo_folder, "/high_res_ai_class_sizes.csv"), row.names = F)
+```
+
+# Saving these annotations as they're clean
+
+```{r}
+write.csv(ai_annotations_taxonomy, paste0(yolo_folder, "/clean_ai_annotations.csv"), row.names = F)
+
+```
+
+# Extracting Cnidarian (exc. hydroids) annotations
+
+```{r}
+# cnidarian_annotations<-ai_annotations_taxonomy %>%
+#   filter(str_detect(ai_class, "Colonial scleractinians|Anemone and anemone-like|Cup corals|Soft corals|Fan 2D BO corals|Branching 3D BO corals|Hydrocorals|Unbranched BO corals|Bottlebrush BO corals"))
+# 
+# cnidarian_ai_class_sizes<-cnidarian_annotations %>%
+#   # keep the label and its hierarchy
+#   group_by(ai_class) %>%
+#   # count the
+#   summarise(count = n()) #%>%
+#   #mutate(modellable=case_when(count <200 ~ "no", count >=200 ~"yes"))
+# 
+# write.csv(cnidarian_ai_class_sizes, paste0(yolo_folder, "/cnidarian_ai_class_sizes.csv"), row.names = F)
+# write.csv(cnidarian_annotations, paste0(yolo_folder, "/clean_cnidarian_ai_annotations.csv"), row.names = F)
+```
+
+# Now open the BIIGLE to YoloV5_AB script

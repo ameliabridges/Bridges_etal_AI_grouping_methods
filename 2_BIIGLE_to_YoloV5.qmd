@@ -1,0 +1,846 @@
+---
+title: "BIIGLE to Yolov5"
+author: "Amelia E.H. Bridges"
+format: html
+editor: source
+---
+
+# Prepare your working environment
+
+I've incorporated Nils' envsetup.R script here. It basically makes relevant folders etc.
+
+```{r}
+#| warning: false
+#| message: false
+#| echo: false
+
+
+library(jsonlite)
+library(httr)
+library(zip)
+library(imager)
+library(magick) # throws an error on Mac :(
+library(tidyverse)
+library(magrittr)
+library(reticulate) # if you haven't got python installed this may mess up, in which case just zip the folder manually when you get to it
+
+# Set the name of your colab project
+projectName <- "Full"
+
+```
+
+The following creates folders in the directory you're working in for various files. I've commented out folders that I don't think I need as I've already done some of the work in Nils' Biigle to YoloV5 script.
+
+```{r}
+
+large_folder<-"/Volumes/One Touch/Current_work/AI" # developing my wd in the C drive as I think it might speed things up
+
+for_yolo_files<-paste0(large_folder,"/colabfiles") # will contain files that you will have to upload to Colab
+dir.create(for_yolo_files)
+
+yolo_results<-paste0(large_folder, "/YoloResults") # this folder will be used later once you have made predictiosn with your CNN
+dir.create(yolo_results)
+
+images_dir <- paste0(large_folder, "/imageDL")
+
+```
+
+# Import the cleaned annotations you made in the Data_check_functions.qmd process
+
+```{r}
+annotations<-read.csv("clean_ai_annotations.csv", head=TRUE, sep=",")
+ai_classes<-read.csv("ai_class_sizes.csv", head=TRUE, sep=",")
+
+```
+
+# Choose which classes you want to model
+
+```{r}
+# these are my classes in descending order
+ai_classes %>%
+  arrange(desc(count))
+
+# make a list of labels you want to take to train your model on
+OBJ_NAME<-ai_classes %>%
+ select(1)
+
+print(OBJ_NAME)
+```
+
+When you're working with OTU codes, sometimes you might want more human readable names. The following section does this.
+
+As I'm working with groupings, it doesn't make sense for me to rename as they're clear already, so I've commented most of the code out and renamed my column so it works with Nils' code.
+
+```{r}
+
+# make a new column of better names (rather than the Biigle catalogues names)
+# OBJ_NAME %>% 
+#   mutate(Yolo_labelNames = label_name %>%  
+#            as.factor() )
+# 
+# # Use a list of names for the different OTU you have selected --- HAVE TO BE IN THE RIGHT ORDER
+# OBJ_NAME %<>%  
+#   mutate( Yolo_labelNames =  if_else(Yolo_labelNames == "OTU585",  "Acanella", Yolo_labelNames %>% 
+#                                        as.character() ) )
+
+# alternatively - put a new names column -- !! make sure they are in the right order
+#       OBJ_NAME %<>%  mutate(Yolo_labelNames = c("Acanella","Ignore")) # deactivated by default
+
+# alternatively - manually edit the table - this will open a table window where you can type new names
+#       OBJ_NAME %<>% edit() # deactivated by default
+
+# add a class code - a numerical code that will be used by yolo instead of the text labels
+#either by letting R decide what is what level
+  # OBJ_NAME %<>%  mutate( class_code = as.numeric(Yolo_labelNames) -1 )
+# or by keeping the current label order
+
+OBJ_NAME %<>%  
+  mutate(Yolo_labelNames = ai_class) %>%
+  mutate(class_code = 0:(nrow(OBJ_NAME)-1))
+
+print(OBJ_NAME)
+```
+
+# Filtering modellable annotations
+
+```{r}
+
+d_annotations<-annotations %>%
+  filter(ai_class %in% OBJ_NAME$ai_class) %>% # keeps only the labels from OBJ_NAME
+  select(1:20, 25) %>% #this is just to match Nil's df as lots of the morphology info is not needed
+  left_join(OBJ_NAME, by="ai_class") %>% # adds 'Yolo_labelNames' and 'class_code' columns
+  as_tibble()
+
+d_annotations$ai_class<-NULL
+
+```
+
+# Convert annotation format
+
+YOLO uses a specific format which is different from the way BIIGLE exports the coordinates of annotations - namely, the coordinates have different origins and in BIIGLE, are expressed in pixels whereas in YOLO, they're expressed in relative height and width of the image.
+
+Code for converting between YOLO and BIIGLE formats is dependent on what shape the annotations use (hence the importance of the tool check step in the data check). I know all my annotations are rectangles, therefore I've removed Nils' code for all other shapes bar these.
+
+```{r}
+
+d_annotations<-d_annotations %>%
+  drop_na(attributes)# for 18 annotaions, there was NA in the attributes column which meant the chunk didn't run. I checked the original BIIGLE exportd nad BIIGLE seems to have corrupted the images whereby the thumbnails are showing ad the raw export doesn't contain attribute info. Thereofre I have no choice but to delete them by running drop_na() on that column
+
+ForYoloimageAnnotation<-d_annotations
+
+# put the attributes of the annotations into the right format
+ForYoloimageAnnotation<-d_annotations %>%
+  split(.$annotation_id) %>%
+  map(
+    function(X)
+      tibble(
+        image_width = X$attributes %>%  fromJSON() %>%
+          magrittr::extract("width") %>% as.numeric(),
+        image_height = X$attributes %>%  fromJSON() %>%
+          magrittr::extract("height") %>% as.numeric()
+      )
+  ) %>%
+  bind_rows(.id = "annotation_id") %>%
+  mutate(annotation_id = as.numeric(annotation_id)) %>%
+  left_join(ForYoloimageAnnotation , by = "annotation_id") %>%
+  rename(label = Yolo_labelNames)
+
+# First explore the label name and
+ForYoloimageAnnotation %>%
+  count(shape_name) %>%
+  print()
+
+# this is what we are aiming for
+yolopointnames <- c("center.x" , "center.y" , "width", "height") # keep uncommented otherwise later code doesn't work
+
+
+# if the shape is rectangle
+d.i<-ForYoloimageAnnotation %>% filter(shape_name == "Rectangle")
+
+# this is the worst shape as each corner has to be considered seprately
+pointnames <-
+      c("xleft1",
+        "ybottom1",
+        "xleft2",
+        "ytop1",
+        "xright1",
+        "ytop2",
+        "xright2",
+        "ybottom2")
+
+l.i<-d.i %>%
+      pull(points) %>%
+      str_remove(pattern = fixed("[")) %>%
+      str_remove(pattern = "]") %>%
+      str_split(pattern = ",")
+
+# this step step takes a while to run
+yolo_d.i<-map(l.i, function(X)
+      tibble(points = pointnames , value = unlist(X) %>%  as.numeric()) %>%
+        # because manual rectangles
+        pivot_wider(names_from = points, values_from =   value) %>%
+        mutate(
+          width = abs(max(c(xleft1, xleft2, xright1, xright2)) - min(c(xleft1, xleft2, xright1, xright2))),
+          height = abs(max(c(ytop1, ytop2,ybottom1, ybottom2)) - min(c(ytop1, ytop2,ybottom1, ybottom2))),
+          center.x = mean( c( max(c(xright1, xright2)), min(c(xleft1, xleft2)) )  ),
+          center.y = mean(c( max(c(ytop1, ytop2)) , min(c(ybottom1, ybottom2))) ) ,
+        ) %>%   dplyr::select(all_of(yolopointnames)))
+
+# shape the rectangle data
+yolo_rectangle<-yolo_d.i %>%
+  bind_rows() %>%
+  bind_cols(select(d.i,label,class_code,annotation_id,filename,image_width,image_height))
+
+
+# rm(yolo_d.i)
+yolo_d.i<-bind_rows(yolo_rectangle) %>% # if you have >1 annotation type, here you bind yolo_point, yolo_circle etc too.
+   arrange(annotation_id)
+
+# now normalize for each image - transform coordinates in pixels into relative heights and width
+yolo_annotations<-yolo_d.i %>%
+  mutate(center.x = center.x / image_width,
+         center.y = center.y / image_height,
+         width = width / image_width,
+         height = height / image_height)
+
+write.csv(yolo_annotations, paste0(images_dir, "/yolo_annotations_full.csv"), row.names = FALSE)
+
+yolo_annotations<-read.csv(paste0(images_dir, "/yolo_annotations_full.csv"), sep=",", head=TRUE)
+```
+
+# Add the pathway to the images
+
+It's better to have downloaded all the images onto a drive already so I've removed the download from the amazon bucket code.
+
+```{r}
+
+# make a table of images and path to each of them - takes a while if you have lots of images
+imgs_paths<-images_dir %>%
+  list.files(recursive = T, full.names = T)
+
+imgs_list<-images_dir %>%
+  list.files(recursive = T, full.names = F,include.dirs = F)
+
+imgs_names<-imgs_list %>%
+  str_split(pattern = "/") %>%
+  map(~ extract2(.x, length(.x))) %>%
+  unlist()
+
+# format the table
+img_PATHWAYS<-tibble(image = imgs_list,
+                     path = imgs_paths,
+                     filename = imgs_names)
+
+
+
+write.csv(img_PATHWAYS, paste0(images_dir, "/img_PATHWAYS.csv"), row.names = FALSE)
+
+img_PATHWAYS<-read.csv(paste0(images_dir, "/img_PATHWAYS.csv"), sep=",", head=TRUE)
+
+# merge images metadata including the path and dimensions
+yolo_annotations_path<-img_PATHWAYS %>%
+  left_join(yolo_annotations, . , by = "filename" )
+
+# make sure all images are matched to their pathways
+mismatched<-yolo_annotations_path %>%
+  filter(is.na(path)) 
+
+# if the code below prints 0 images have not been matched, you're good to proceed
+paste0(nrow(mismatched), " images have not been matched")
+
+```
+
+# Check what your resized annotations look like
+
+```{r}
+# randomly take a couple of images to see how the annotations plot over these
+imgforplot<-yolo_annotations_path %>%
+  distinct(filename) %>%
+  pull(filename) %>%
+  sample(20)
+
+yolo_annotationsForplot<-yolo_annotations_path %>%
+  filter(filename %in% imgforplot) 
+  
+imgs<-yolo_annotationsForplot %>%
+  distinct(filename) %>%
+  pull()
+
+ 
+# make a folder of images where your images with annotations will be
+target_dir <- paste0(large_folder,"/testAnnotations")
+target_dir %>% dir.create()
+
+for (I in seq(imgs)) {
+  imgs[I] -> img.I
+  print(img.I)
+  
+   
+  # open the annotations 
+  yolo_annotationsForplot %>% filter(filename == img.I) -> annotations.I
+  
+  # open the images
+  annotations.I %>%  distinct(path) %>%  pull() %>% magrittr::extract(1) %>% 
+  load.image( ) -> image2
+  
+  
+  for (i in 1:nrow(annotations.I)) {
+    # take the annotation
+    
+    annotations.I %>%  slice(i) -> r.i
+    
+    # descale teh coordinates to pixels
+    xleft <- (r.i$center.x * width(image2) ) - (r.i$width* width(image2)/2) 
+    ybottom <- (r.i$center.y*height(image2) ) - (r.i$height*height(image2)/2)  
+    xright <- (r.i$center.x* width(image2) ) + (r.i$width* width(image2)/2)  
+    ytop <- (r.i$center.y*height(image2) ) + (r.i$height*height(image2)/2)  
+    
+    c(xleft  ,ybottom  ,xright   ,ytop      ) -> v
+    
+    # plot it over the image
+    imager::draw_rect(  image2 ,v[1],v[2],v[3],v[4], opacity = 0.1 ,filled =  TRUE, color = rainbow(10)[i] ) -> image2
+    
+     
+     
+  }
+  
+  # export the image
+  
+  imager::save.image(image2, paste0(target_dir,"/",img.I %>%  str_replace(pattern = "png",replacement = "jpg") )  )
+  
+}
+
+```
+
+These all look good!
+
+# Make training and testing set
+
+Now you need to separate the annotations between a train and a test folder. It's worth knowing that with Darknet, you need a training set that is used throughout training to calculate mAP at regular intervals. This may be refereed to as train and val.
+
+This step will vary depending on how you choose to resample you data. You may not want to take all your images.
+
+Both training and testing sets will be saved as tables that can be re-opened later.
+
+```{r  message=FALSE}
+
+# make a vector of all the image names (4499 images)
+v<-yolo_annotations_path %>%
+  distinct(filename) %>%
+  pull()
+
+# takes the distinct image names and assigns a number and then merges with the annotations df - this is so all annotations in the same image stay together because they have the same shuffleid (column 2 in d1)
+d1<-sample(v, length(v)) %>%
+  tibble(filename = ., shuffleid = 1:length(.)) %>%
+  left_join(yolo_annotations_path)
+
+# makes a vector containing the names of 75% of the images (3374 images) - these are going to be the annotations you train your model with. Remember, every time you run this line of code, the selection changes.
+v1<-d1  %>%
+  distinct(filename) %>%
+  pull(filename) %>%
+  sample(length(.) * 0.75)
+
+# now we extract the annotations from our big old annotations df for our TRAINING images (those in the v1 vector)
+d_training<-d1 %>%
+  filter(filename %in% v1)
+
+# now we extract the annotations from our big old annotations df for our TEST images (those NOT in the v1 vector). These will be used to test the CNN performances and calculate recall and precision.
+d_testing_Val<-d1 %>%
+  filter(!filename %in% v1)
+
+# you can check this code is correct and better understand it by printing out v1 and copying a random image name onto your clipboard. View(d_training). Paste the image name into the search bar and it should show you the corresponding annotations. If you do the same but with d_testing_Val open, you should have no results. 
+
+# print down how many annotations you have in training
+# print(paste0(nrow(d_training), " annotations in training (", d_training %>% distinct(filename) %>% nrow()," images)"))
+# 
+# # and print down how many files you should have in your folder
+# print(paste0(d_training %>%  count(filename)  %>% nrow() * 2, " single files in training folder"))
+
+write.csv(d_training, paste0(for_yolo_files, "/train_set_full.csv"), row.names = F)
+
+# print down how many annotations you have in testing
+# print(paste0(nrow(d_testing_Val), " annotations for testing (", d_testing_Val %>% distinct(filename) %>% nrow()," images)"))
+# 
+# # and print down how many files you should have in your folder
+# print(paste0(d_testing_Val %>%  count(filename)  %>% nrow() * 2, " single files in testing folder"))
+
+write.csv(d_testing_Val, paste0(for_yolo_files, "/test_set_full.csv"), row.names = F)
+
+# export the labels
+# labels_info<-OBJ_NAME%>%
+#   arrange(class_code)
+# 
+# write.csv(labels_info, paste0(for_yolo_files, "/", projectName, "_labels_info.csv"), row.names = F)
+# 
+# labels<-OBJ_NAME%>%
+#   arrange(class_code)%>%
+#   select(Yolo_labelNames)
+# 
+# write_delim(labels, paste0(for_yolo_files, "/", projectName, "_labels.txt"), col_names = F)
+
+d_testing_Val<-d_testing_Val%>%
+  mutate(split = "val")
+
+d_training<-d_training%>%
+  mutate(split = "train")
+
+master<-rbind(d_testing_Val, d_training)
+
+write.csv(master, paste0(for_yolo_files, "/combined_train_test.csv"), row.names = F)
+```
+
+When you're balancing your classes, you may need to re-jig the train and test data but similarly to transects in HSM, you need all the annotations in an image in **EITHER** test or train.
+
+# Convert labels and classes to test different groups
+
+```{r}
+master<-read.csv(paste0(for_yolo_files, "/combined_train_test.csv"), sep=",", head=T)
+conversion<-read.csv(paste0(for_yolo_files, "/ai_class_conversions.csv"), sep=",", head=T)
+```
+
+## Phylum
+
+```{r}
+conversion_p<-conversion%>%
+  dplyr::rename(label=full,
+                new_label=phylum,
+                class_code=full_code,
+                new_class_code=phylum_code)%>%
+  select(-c(animal, animal_code))
+
+phylum<-left_join(master, conversion_p, by="label") %>% 
+  select(1:6, 16, 17, 9:14)%>%
+  dplyr::rename(label=new_label, 
+                class_code=new_class_code)
+
+phylum_train<-phylum %>% 
+  filter(split=="train")
+
+phylum_test<-phylum %>% 
+  filter(split=="val")
+
+write.csv(phylum_train, paste0(for_yolo_files, "/train_set_phylum.csv"), row.names = F)
+
+write.csv(phylum_test, paste0(for_yolo_files, "/test_set_phylum.csv"), row.names = F)
+```
+
+## Animal
+
+```{r}
+conversion_a<-conversion%>%
+  dplyr::rename(label=full,
+                new_label=animal,
+                class_code=full_code,
+                new_class_code=animal_code)%>%
+  select(-c(phylum, phylum_code))
+
+animal<-left_join(master, conversion_a, by="label") %>% 
+  select(1:6, 16, 17, 9:14)%>%
+  dplyr::rename(label=new_label, 
+                class_code=new_class_code)
+
+animal_train<-animal %>% 
+  filter(split=="train")
+
+animal_test<-animal %>% 
+  filter(split=="val")
+
+write.csv(animal_train, paste0(for_yolo_files, "/train_set_animal.csv"), row.names = F)
+
+write.csv(animal_test, paste0(for_yolo_files, "/test_set_animal.csv"), row.names = F)
+```
+
+# Make the files for Yolo local and on Colab
+
+For each image, the annotations have to be written into a text file, and the images and annotations have to be together in the same folder.
+
+If you so desire you can re-scale your images to save space on cloud storage. This is not recommended as it may impact the performances.
+
+```{r  message=FALSE}
+# would you like to resize your image?
+# there is a built-in if statement that allows you to make images smaller in size so they take less space on gdrive (and quicker to upload)
+# don't resize for training. and don't resize unless absolutely necessary. let yolo handle it for you
+ 
+resize_enabled <- "no"
+rescale_factor <- 0.8
+
+# make yolo zip files for training and testing sets
+for (training_OR_testing in c("train", "test")) {
+  
+  if(training_OR_testing == "train"){
+    # teh trainin gset
+    read_csv( paste0(for_yolo_files,"/train_set_full.csv") ) ->  annotations
+    labelsfolder  <-  paste0(for_yolo_files,"/",projectName, "/labels/train" )
+    imagefolder <- paste0(for_yolo_files,"/",projectName, "/images/train")
+    print("Making the training set")
+  }else if(training_OR_testing == "test"){
+    read_csv(  paste0(for_yolo_files,"/test_set_full.csv") ) -> annotations
+    labelsfolder  <-  paste0(for_yolo_files,"/",projectName, "/labels/val" )
+    imagefolder <- paste0(for_yolo_files,"/",projectName, "/images/val")
+    print("Making the testing set")
+  }
+  
+  # create a fodler
+  
+dir.create(labelsfolder,recursive = T)
+dir.create(imagefolder, recursive = T)
+  
+  
+  # for each image in the annotations table 
+imgs<- annotations %>%
+   count(filename) %>%
+   pull(filename)
+ 
+for(i in seq(imgs)){
+    
+    
+    imgs[i] -> imgs.i
+    # get the image name no matter the extention
+    imgs.i %>%  str_split(pattern = fixed(".") ) %>% unlist()  %>%   magrittr::extract(1)  -> imagename.i
+    
+    # set path the image 
+    # or from the existing repository
+    imagepath.i <- annotations %>%  filter(filename == imgs.i) %>%  distinct( path    ) %>% pull()
+    
+    # some time stamps can be matched multiple times if they are records for several species
+    # pick the first one 
+    if(length(imagepath.i) > 1 ){ imagepath.i[1] -> imagepath.i}
+    # always take the image from the every20s folder
+    # if(length(imagepath.i) > 1 ){ imagepath.i %<>% str_subset(pattern = "every20s" ) }
+    
+    annotations %>%  filter(filename == imgs.i) %>%
+      distinct(center.x, center.y,  width, height, .keep_all = T) %>% 
+      select(all_of(c("class_code", yolopointnames))) -> labels_txt
+    # round the coordinates to only 2 digits
+    labels_txt %<>%
+      mutate(across(c(center.x, center.y, width, height), round, digits = 2  ) )
+    
+    # Export the txt file
+    write.table(labels_txt, quote = FALSE, row.names = FALSE, 
+                col.names = F, file = paste0(labelsfolder,"/",imagename.i,".txt") )  
+    #  export the image IN JPG
+    if(resize_enabled == "yes" & training_OR_testing == "test"){
+      
+      annotations %>%  filter(filename == imgs.i) %>% pull(path)  %>%  image_read() -> auv_image
+      
+      # without a rescale factor object:
+      # image_resize(auv_image, "800x800!") -> auv_image
+      # with the rescale factor set manually
+      image_info(auv_image) %>% pull(height) -> v
+      v*rescale_factor -> rescale_coef
+      image_scale(auv_image, paste0("X",rescale_coef)) -> auv_image
+      
+      image_write(  auv_image ,  paste0(imagefolder,"/",imagename.i,".jpg" ) )
+      
+      
+    }else{ file.copy(from = imagepath.i,
+                     to = paste0(imagefolder,"/",imagename.i,".jpg"), overwrite = T)}
+    
+    rm(labels_txt, imagepath.i, imagename.i)
+    
+  } # next image
+  
+  
+}# next set
+
+
+
+ 
+```
+
+One more file is needed: a .yaml file that has the info on the structure of your dataset. The path arguments tells Yolov5 where to look for images and annotations. The exact path will depend on where your stored your things and how you want to run it. By default I have set it in the parent directory (../) of the YoloV5 on your local machine.
+
+The number of classes and class names should be gathered from your tables. This is simple: just a list of names of your category. If you have only one, it should just be: 'Acanella'.
+
+If you have more than one, this file should be: class1, class2, class3, class4, etc.
+
+```{r}
+# make the yaml file
+
+data.frame(
+  X = c(
+    paste0("path: ./datasets/", projectName, " # dataset root dir"),
+    "train: images/train # train images (relative to 'path')" ,
+    "val: images/val # val images (relative to 'path')" ,
+    "test:  # test images (optional)",
+    "#Classes",
+    paste0("nc: ",nrow(OBJ_NAME),"  # number of classes"),
+    paste0("names: ", paste0(OBJ_NAME$Yolo_labelNames,collapse = "','") %>% paste0("['" ,. , "'] # classes names") )
+  )
+) %>%
+  format_csv(col_names = F) %>%
+  # remove the last line jump so the file does not end with an empty line
+  str_sub(start = 0, end = -2) %>% 
+  # remove some " that shouldnt be there
+  str_replace(pattern = '"names',replacement = "names") %>% 
+  str_replace(pattern = 'names"',replacement = "names") %>%
+  cat(sep = "",
+      file = paste0(for_yolo_files,"/",projectName, "/", "dataset_full.yaml"))
+
+
+```
+
+## Phylum
+
+```{r}
+projectName <- "Phylum"
+```
+
+
+```{r  message=FALSE}
+# would you like to resize your image?
+# there is a built-in if statement that allows you to make images smaller in size so they take less space on gdrive (and quicker to upload)
+# don't resize for training. and don't resize unless absolutely necessary. let yolo handle it for you
+ 
+resize_enabled <- "no"
+rescale_factor <- 0.8
+
+# make yolo zip files for training and testing sets
+for (training_OR_testing in c("train", "test")) {
+  
+  if(training_OR_testing == "train"){
+    # teh trainin gset
+    read_csv( paste0(for_yolo_files,"/train_set_phylum.csv") ) ->  annotations
+    labelsfolder  <-  paste0(for_yolo_files,"/",projectName, "/labels/train" )
+    imagefolder <- paste0(for_yolo_files,"/",projectName, "/images/train")
+    print("Making the training set")
+  }else if(training_OR_testing == "test"){
+    read_csv(  paste0(for_yolo_files,"/test_set_phylum.csv") ) -> annotations
+    labelsfolder  <-  paste0(for_yolo_files,"/",projectName, "/labels/val" )
+    imagefolder <- paste0(for_yolo_files,"/",projectName, "/images/val")
+    print("Making the testing set")
+  }
+  
+  # create a fodler
+  
+dir.create(labelsfolder,recursive = T)
+dir.create(imagefolder, recursive = T)
+  
+  
+  # for each image in the annotations table 
+imgs<- annotations %>%
+   count(filename) %>%
+   pull(filename)
+ 
+for(i in seq(imgs)){
+    
+    
+    imgs[i] -> imgs.i
+    # get the image name no matter the extention
+    imgs.i %>%  str_split(pattern = fixed(".") ) %>% unlist()  %>%   magrittr::extract(1)  -> imagename.i
+    
+    # set path the image 
+    # or from the existing repository
+    imagepath.i <- annotations %>%  filter(filename == imgs.i) %>%  distinct( path    ) %>% pull()
+    
+    # some time stamps can be matched multiple times if they are records for several species
+    # pick the first one 
+    if(length(imagepath.i) > 1 ){ imagepath.i[1] -> imagepath.i}
+    # always take the image from the every20s folder
+    # if(length(imagepath.i) > 1 ){ imagepath.i %<>% str_subset(pattern = "every20s" ) }
+    
+    annotations %>%  filter(filename == imgs.i) %>%
+      distinct(center.x, center.y,  width, height, .keep_all = T) %>% 
+      select(all_of(c("class_code", yolopointnames))) -> labels_txt
+    # round the coordinates to only 2 digits
+    labels_txt %<>%
+      mutate(across(c(center.x, center.y, width, height), round, digits = 2  ) )
+    
+    # Export the txt file
+    write.table(labels_txt, quote = FALSE, row.names = FALSE, 
+                col.names = F, file = paste0(labelsfolder,"/",imagename.i,".txt") )  
+    #  export the image IN JPG
+    if(resize_enabled == "yes" & training_OR_testing == "test"){
+      
+      annotations %>%  filter(filename == imgs.i) %>% pull(path)  %>%  image_read() -> auv_image
+      
+      # without a rescale factor object:
+      # image_resize(auv_image, "800x800!") -> auv_image
+      # with the rescale factor set manually
+      image_info(auv_image) %>% pull(height) -> v
+      v*rescale_factor -> rescale_coef
+      image_scale(auv_image, paste0("X",rescale_coef)) -> auv_image
+      
+      image_write(  auv_image ,  paste0(imagefolder,"/",imagename.i,".jpg" ) )
+      
+      
+    }else{ file.copy(from = imagepath.i,
+                     to = paste0(imagefolder,"/",imagename.i,".jpg"), overwrite = T)}
+    
+    rm(labels_txt, imagepath.i, imagename.i)
+    
+  } # next image
+  
+  
+}# next set
+
+
+
+ 
+```
+
+One more file is needed: a .yaml file that has the info on the structure of your dataset. The path arguments tells Yolov5 where to look for images and annotations. The exact path will depend on where your stored your things and how you want to run it. By default I have set it in the parent directory (../) of the YoloV5 on your local machine.
+
+The number of classes and class names should be gathered from your tables. This is simple: just a list of names of your category. If you have only one, it should just be: 'Acanella'.
+
+If you have more than one, this file should be: class1, class2, class3, class4, etc.
+
+```{r}
+# make the yaml file
+
+data.frame(
+  X = c(
+    paste0("path: ./datasets/", projectName, " # dataset root dir"),
+    "train: images/train # train images (relative to 'path')" ,
+    "val: images/val # val images (relative to 'path')" ,
+    "test:  # test images (optional)",
+    "#Classes",
+    paste0("nc: ",length(unique(conversion_p$new_label)),"  # number of classes"),
+    paste0("names: ", paste0(unique(conversion_p$new_label),collapse = "','") %>% paste0("['" ,. , "'] # classes names") )
+  )
+) %>%
+  format_csv(col_names = F) %>%
+  # remove the last line jump so the file does not end with an empty line
+  str_sub(start = 0, end = -2) %>% 
+  # remove some " that shouldnt be there
+  str_replace(pattern = '"names',replacement = "names") %>% 
+  str_replace(pattern = 'names"',replacement = "names") %>%
+  cat(sep = "",
+      file = paste0(for_yolo_files,"/",projectName, "/", "dataset_phylum.yaml"))
+
+
+
+```
+
+## Animal
+
+```{r}
+projectName <- "Animal"
+```
+
+```{r  message=FALSE}
+# would you like to resize your image?
+# there is a built-in if statement that allows you to make images smaller in size so they take less space on gdrive (and quicker to upload)
+# don't resize for training. and don't resize unless absolutely necessary. let yolo handle it for you
+ 
+resize_enabled <- "no"
+rescale_factor <- 0.8
+
+# make yolo zip files for training and testing sets
+for (training_OR_testing in c("train", "test")) {
+  
+  if(training_OR_testing == "train"){
+    # teh trainin gset
+    read_csv( paste0(for_yolo_files,"/train_set_animal.csv") ) ->  annotations
+    labelsfolder  <-  paste0(for_yolo_files,"/",projectName, "/labels/train" )
+    imagefolder <- paste0(for_yolo_files,"/",projectName, "/images/train")
+    print("Making the training set")
+  }else if(training_OR_testing == "test"){
+    read_csv(  paste0(for_yolo_files,"/test_set_animal.csv") ) -> annotations
+    labelsfolder  <-  paste0(for_yolo_files,"/",projectName, "/labels/val" )
+    imagefolder <- paste0(for_yolo_files,"/",projectName, "/images/val")
+    print("Making the testing set")
+  }
+  
+  # create a fodler
+  
+dir.create(labelsfolder,recursive = T)
+dir.create(imagefolder, recursive = T)
+  
+  
+  # for each image in the annotations table 
+imgs<- annotations %>%
+   count(filename) %>%
+   pull(filename)
+ 
+for(i in seq(imgs)){
+    
+    
+    imgs[i] -> imgs.i
+    # get the image name no matter the extention
+    imgs.i %>%  str_split(pattern = fixed(".") ) %>% unlist()  %>%   magrittr::extract(1)  -> imagename.i
+    
+    # set path the image 
+    # or from the existing repository
+    imagepath.i <- annotations %>%  filter(filename == imgs.i) %>%  distinct( path    ) %>% pull()
+    
+    # some time stamps can be matched multiple times if they are records for several species
+    # pick the first one 
+    if(length(imagepath.i) > 1 ){ imagepath.i[1] -> imagepath.i}
+    # always take the image from the every20s folder
+    # if(length(imagepath.i) > 1 ){ imagepath.i %<>% str_subset(pattern = "every20s" ) }
+    
+    annotations %>%  filter(filename == imgs.i) %>%
+      distinct(center.x, center.y,  width, height, .keep_all = T) %>% 
+      select(all_of(c("class_code", yolopointnames))) -> labels_txt
+    # round the coordinates to only 2 digits
+    labels_txt %<>%
+      mutate(across(c(center.x, center.y, width, height), round, digits = 2  ) )
+    
+    # Export the txt file
+    write.table(labels_txt, quote = FALSE, row.names = FALSE, 
+                col.names = F, file = paste0(labelsfolder,"/",imagename.i,".txt") )  
+    #  export the image IN JPG
+    if(resize_enabled == "yes" & training_OR_testing == "test"){
+      
+      annotations %>%  filter(filename == imgs.i) %>% pull(path)  %>%  image_read() -> auv_image
+      
+      # without a rescale factor object:
+      # image_resize(auv_image, "800x800!") -> auv_image
+      # with the rescale factor set manually
+      image_info(auv_image) %>% pull(height) -> v
+      v*rescale_factor -> rescale_coef
+      image_scale(auv_image, paste0("X",rescale_coef)) -> auv_image
+      
+      image_write(  auv_image ,  paste0(imagefolder,"/",imagename.i,".jpg" ) )
+      
+      
+    }else{ file.copy(from = imagepath.i,
+                     to = paste0(imagefolder,"/",imagename.i,".jpg"), overwrite = T)}
+    
+    rm(labels_txt, imagepath.i, imagename.i)
+    
+  } # next image
+  
+  
+}# next set
+
+
+
+ 
+```
+
+One more file is needed: a .yaml file that has the info on the structure of your dataset. The path arguments tells Yolov5 where to look for images and annotations. The exact path will depend on where your stored your things and how you want to run it. By default I have set it in the parent directory (../) of the YoloV5 on your local machine.
+
+The number of classes and class names should be gathered from your tables. This is simple: just a list of names of your category. If you have only one, it should just be: 'Acanella'.
+
+If you have more than one, this file should be: class1, class2, class3, class4, etc.
+
+```{r}
+# make the yaml file
+
+data.frame(
+  X = c(
+    paste0("path: ./datasets/", projectName, " # dataset root dir"),
+    "train: images/train # train images (relative to 'path')" ,
+    "val: images/val # val images (relative to 'path')" ,
+    "test:  # test images (optional)",
+    "#Classes",
+    paste0("nc: ",length(unique(conversion_a$new_label)),"  # number of classes"),
+    "names: ['Animal'] # classes names"
+  )
+) %>%
+  format_csv(col_names = F) %>%
+  # remove the last line jump so the file does not end with an empty line
+  str_sub(start = 0, end = -2) %>% 
+  # remove some " that shouldnt be there
+  str_replace(pattern = '"names',replacement = "names") %>% 
+  str_replace(pattern = 'names"',replacement = "names") %>%
+  cat(sep = "",
+      file = paste0(for_yolo_files,"/",projectName, "/", "dataset_animal.yaml"))
+
+
+
+```
+
+# Now run the models in Google Colab 
